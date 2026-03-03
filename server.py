@@ -1,5 +1,5 @@
 
-# 
+# this code can run a server on the BS and sends telemetry data ,cam feed ,file uploadation via base ip 
 from flask import Flask, render_template_string, request, send_from_directory, Response
 from flask_socketio import SocketIO, emit
 import threading
