@@ -1,0 +1,305 @@
+# ─────────────────────────────────────────
+#  BASE STATION - RPi 1
+#  OS: Ubuntu 24.10
+#
+#  Install:
+#    sudo apt install -y python3-pip i2c-tools libgpiod-dev
+#    pip install lgpio luma.oled smbus2
+#
+#  Enable I2C:
+#    sudo nano /boot/firmware/config.txt
+#    Add: dtparam=i2c_arm=on
+#    sudo reboot
+#
+#  GPIO permissions:
+#    sudo usermod -aG i2c,gpio $USER
+#    sudo chmod a+rw /dev/gpiochip0
+#
+#  Verify devices:
+#    i2cdetect -y 1  (should show 0x3C for OLED)
+# ─────────────────────────────────────────
+
+import lgpio
+import time
+import socket
+import threading
+from smbus2 import SMBus, i2c_msg
+from luma.core.interface.serial import i2c
+from luma.oled.device import sh1106
+from luma.core.render import canvas
+
+# ─────────────────────────────────────────
+#  GPIO Setup
+# ─────────────────────────────────────────
+SW1 = 17
+SW2 = 27
+T1  = 23
+T2  = 25
+
+h = lgpio.gpiochip_open(0)
+lgpio.gpio_claim_input(h, SW1, lgpio.SET_PULL_UP)
+lgpio.gpio_claim_input(h, SW2, lgpio.SET_PULL_UP)
+lgpio.gpio_claim_output(h, T1)
+lgpio.gpio_claim_output(h, T2)
+
+lgpio.gpio_write(h, T1, 0)
+lgpio.gpio_write(h, T2, 0)
+
+def t1_start():
+    print("[+] T1 HIGH - Start Charger")
+    lgpio.gpio_write(h, T1, 1)
+    time.sleep(4)
+    lgpio.gpio_write(h, T1, 0)
+    print("[+] T1 OFF")
+
+def t2_stop():
+    print("[-] T2 HIGH - Stop Charger")
+    lgpio.gpio_write(h, T2, 1)
+    time.sleep(2)
+    lgpio.gpio_write(h, T2, 0)
+    print("[-] T2 OFF")
+
+# ─────────────────────────────────────────
+#  Shared Voltage State (received from RPi 2)
+# ─────────────────────────────────────────
+V_MIN = 13.2
+V_MAX = 16.8
+
+latest_voltage = 0.0
+voltage_lock   = threading.Lock()
+
+def get_voltage():
+    with voltage_lock:
+        return latest_voltage
+
+def voltage_to_percent(v):
+    pct = (v - V_MIN) / (V_MAX - V_MIN) * 100
+    return max(0, min(100, round(pct)))
+
+# ─────────────────────────────────────────
+#  OLED Setup
+#  sh1106 128x64 on I2C bus 1, address 0x3C
+# ─────────────────────────────────────────
+try:
+    serial = i2c(port=1, address=0x3C)
+    oled   = sh1106(serial, rotate=0)
+    print("[OK] OLED initialized at 0x3C")
+except Exception as e:
+    print(f"[!!] OLED init failed: {e}")
+    print("     Check wiring and run: i2cdetect -y 1")
+    lgpio.gpiochip_close(h)
+    exit(1)
+
+def draw_screen(status, voltage, drone_pct=None):
+    pct     = voltage_to_percent(voltage)
+    bar_pct = drone_pct if drone_pct is not None else pct
+    BAR_X   = 0
+    BAR_Y   = 28
+    BAR_W   = 118
+    BAR_H   = 14
+    FILL_W  = int(BAR_W * bar_pct / 100)
+    TIP_X   = BAR_X + BAR_W
+    TIP_Y   = BAR_Y + 4
+    TIP_W   = 4
+    TIP_H   = 6
+
+    with canvas(oled) as draw:
+        # Status line
+        draw.text((0, 0), status[:21], fill="white")
+
+        # Voltage + percent line
+        if drone_pct is not None:
+            draw.text((0, 14), f"{voltage}V D:{drone_pct}%", fill="white")
+        else:
+            draw.text((0, 14), f"{voltage}V  {pct}%", fill="white")
+
+        # Battery bar outline
+        draw.rectangle(
+            [BAR_X, BAR_Y, BAR_X + BAR_W, BAR_Y + BAR_H],
+            outline="white", fill="black"
+        )
+        # Battery tip nub
+        draw.rectangle(
+            [TIP_X, TIP_Y, TIP_X + TIP_W, TIP_Y + TIP_H],
+            outline="white", fill="white"
+        )
+        # Battery fill
+        if FILL_W > 2:
+            draw.rectangle(
+                [BAR_X + 2, BAR_Y + 2, BAR_X + 2 + FILL_W - 4, BAR_Y + BAR_H - 2],
+                outline="white", fill="white"
+            )
+        # Percentage label inside bar
+        draw.text(
+            (BAR_X + BAR_W // 2 - 10, BAR_Y + 2),
+            f"{bar_pct}%",
+            fill="black" if bar_pct > 50 else "white"
+        )
+        # Tick marks at 25 / 50 / 75%
+        for mark in [25, 50, 75]:
+            mx = BAR_X + int(BAR_W * mark / 100)
+            draw.line(
+                [mx, BAR_Y, mx, BAR_Y + BAR_H],
+                fill="black" if bar_pct > mark else "white"
+            )
+        # Footer voltage range
+        draw.text((0,   50), f"{V_MIN}V", fill="white")
+        draw.text((50,  50), "4S LiPo",  fill="white")
+        draw.text((100, 50), f"{V_MAX}V", fill="white")
+
+# ─────────────────────────────────────────
+#  Voltage Server — port 8888
+#  Receives "VOLT:<value>" from RPi 2
+# ─────────────────────────────────────────
+VOLT_PORT = 8888
+
+def voltage_server():
+    global latest_voltage
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', VOLT_PORT))
+    server.listen(5)
+    print(f"[*] Voltage server listening on port {VOLT_PORT}")
+    while True:
+        try:
+            conn, addr = server.accept()
+            data = conn.recv(1024).decode().strip()
+            if data.startswith("VOLT:"):
+                v = float(data.split(":")[1])
+                with voltage_lock:
+                    latest_voltage = v
+                print(f"[V] Voltage: {v}V")
+            conn.close()
+        except Exception as e:
+            print(f"[!] Voltage server error: {e}")
+
+threading.Thread(target=voltage_server, daemon=True).start()
+
+# ─────────────────────────────────────────
+#  Drone WiFi Server — port 9999
+#  Receives "BATT:<pct>" or "FULL" from drone
+# ─────────────────────────────────────────
+BASE_PORT    = 9999
+battery_full = False
+drone_pct    = None
+
+def wifi_server():
+    global battery_full, drone_pct
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', BASE_PORT))
+    server.listen(5)
+    print(f"[*] Drone WiFi server listening on port {BASE_PORT}")
+    while True:
+        try:
+            conn, addr = server.accept()
+            data = conn.recv(1024).decode().strip()
+            print(f"[*] Drone msg: {data}")
+            if data.startswith("BATT:"):
+                drone_pct = int(data.split(":")[1])
+            elif data == "FULL":
+                battery_full = True
+                drone_pct    = 100
+                print("[!] Battery FULL signal received!")
+            conn.close()
+        except Exception as e:
+            print(f"[!] Drone WiFi error: {e}")
+
+threading.Thread(target=wifi_server, daemon=True).start()
+
+# ─────────────────────────────────────────
+#  Startup
+# ─────────────────────────────────────────
+print("=========================")
+print("  Drone Base Station")
+print("  Ready. Waiting...")
+print("=========================")
+
+draw_screen("Waiting...", 0.0)
+
+CONFIRM_SECS = 5
+charging     = False
+prev_on_pad  = False
+land_start   = None
+
+# ─────────────────────────────────────────
+#  Main Loop
+# ─────────────────────────────────────────
+try:
+    while True:
+        sw1 = lgpio.gpio_read(h, SW1)
+        sw2 = lgpio.gpio_read(h, SW2)
+        drone_on_pad = (sw1 == 0 and sw2 == 0)
+
+        v = get_voltage()   # latest voltage from RPi 2
+
+        # ── Switches just pressed — start confirmation timer ──
+        if drone_on_pad and land_start is None and not charging:
+            land_start = time.time()
+            print("[*] Switches pressed - confirming landing...")
+            draw_screen("Confirming...", v)
+
+        # ── Switches released before 5s — reset timer ──
+        elif not drone_on_pad and land_start is not None and not charging:
+            print("[!] Switches released early - resetting")
+            land_start = None
+            draw_screen("Waiting...", v)
+
+        # ── Switches held — countdown then confirm ──
+        elif drone_on_pad and land_start is not None and not charging:
+            elapsed   = time.time() - land_start
+            remaining = int(CONFIRM_SECS - elapsed) + 1
+
+            if elapsed < CONFIRM_SECS:
+                draw_screen(f"Landing... {remaining}s", v)
+            else:
+                # Landing confirmed
+                land_start   = None
+                battery_full = False
+                drone_pct    = None
+                print(f"[+] Landing confirmed! Battery: {v}V")
+                draw_screen("Drone Landed!", v)
+                time.sleep(0.5)
+
+                t1_start()        # pulse T1 → start charger
+                charging = True
+                print("[+] Charging Started!")
+
+        # ── Charging — refresh display, check FULL ──
+        elif drone_on_pad and charging:
+            draw_screen("Charging...", v, drone_pct)
+
+            if battery_full:
+                print("[!] Battery Full! Stopping charger...")
+                draw_screen("Battery Full!", v, 100)
+                t2_stop()         # pulse T2 → stop charger
+                charging     = False
+                battery_full = False
+                print("[+] Charger Stopped.")
+
+        # ── Drone lifted off ──
+        elif not drone_on_pad and prev_on_pad:
+            land_start = None
+            if charging:
+                print("[!] Drone departed during charge! Stopping...")
+                t2_stop()
+                charging     = False
+                battery_full = False
+                drone_pct    = None
+            draw_screen("Drone Departed", v)
+
+        # ── Idle ──
+        elif not drone_on_pad and not charging:
+            draw_screen("Waiting...", v)
+
+        prev_on_pad = drone_on_pad
+        time.sleep(0.5)
+
+except KeyboardInterrupt:
+    print("\n[-] Shutting down...")
+    lgpio.gpio_write(h, T1, 0)
+    lgpio.gpio_write(h, T2, 0)
+    time.sleep(0.5)
+    oled.clear()
+    lgpio.gpiochip_close(h)
+    print("[-] Done.")
