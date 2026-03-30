@@ -1,0 +1,59 @@
+import subprocess
+import requests
+import random
+import time
+import os
+
+# --- CONFIG ---
+BASE_IP = "192.168.1.XX"  # <--- SET YOUR BASE RPI IP HERE
+URL = f"http://{BASE_IP}:5000/upload"
+TEMP_IMG = "drone_snap.jpg"
+# --------------
+
+print(f"Drone active. Sending snapshot and telemetry every 2 seconds to {BASE_IP}...")
+
+def capture_and_send():
+    # 1. Capture image using fswebcam
+    # -r: resolution, --no-banner: hides timestamp overlay
+    try:
+        subprocess.run([
+            "fswebcam", "-r", "640x480", "--no-banner", TEMP_IMG
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"Capture error: {e}")
+        return
+
+    if not os.path.exists(TEMP_IMG):
+        print("Capture failed. Check if camera is plugged in.")
+        return
+
+    # 2. Generate Fake IMU Data
+    telemetry = {
+        "roll": round(random.uniform(-10.0, 10.0), 1),
+        "pitch": round(random.uniform(-10.0, 10.0), 1),
+        "yaw": round(random.uniform(0, 360), 1),
+        "alt": round(random.uniform(10.0, 50.0), 2)
+    }
+
+    # 3. Send to Base Station
+    try:
+        with open(TEMP_IMG, "rb") as f:
+            files = {'image': f}
+            r = requests.post(URL, data=telemetry, files=files, timeout=5)
+            print(f"[{time.strftime('%H:%M:%S')}] Data Sent! Status: {r.status_code}")
+    except Exception as e:
+        print(f"Network error: {e}")
+
+try:
+    while True:
+        start_time = time.time()
+        
+        capture_and_send()
+        
+        # Calculate sleep to maintain exactly 2 second interval
+        elapsed = time.time() - start_time
+        wait = max(0, 2.0 - elapsed)
+        time.sleep(wait)
+
+except KeyboardInterrupt:
+    print("\nDrone stopped.")
